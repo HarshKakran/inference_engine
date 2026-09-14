@@ -6,6 +6,8 @@
 #include <vector>
 #include <random>
 #include <string>
+#include <fstream>
+#include <sstream>
 
 int n_ctx = 512;
 float T = 1;
@@ -84,8 +86,30 @@ int pick_logit_topk(float *logits, int n_vocab)
     return softmax_topk_logits.back().first;
 }
 
+void log_to_file(ggml_log_level level, const char *text, void *user_data)
+{
+    FILE *log_file = static_cast<FILE *>(user_data);
+    fprintf(log_file, "%s", text);
+}
+
+void report_error(FILE *log_file, const char *msg)
+{
+    fprintf(stderr, "%s", msg);
+    fprintf(log_file, "%s", msg);
+}
+
 int main()
 {
+    FILE *log_file = fopen("engine.log", "a");
+    if (!log_file)
+    {
+        fprintf(stderr, "failed to open log file.\n");
+        return 1;
+    }
+
+    // logging to file to keep the terminal clean
+    llama_log_set(log_to_file, log_file);
+
     // one-time global init for ggml backends (Metal/CPU registration, threading)
     llama_backend_init();
     // printf("SYSTEM INFO: \n%s\n\n", llama_print_system_info());
@@ -99,11 +123,19 @@ int main()
     llama_model *model = llama_model_load_from_file("models/qwen2.5-3b-instruct-q4_k_m.gguf", mparams);
     if (!model)
     {
-        fprintf(stderr, "failed to load the model\n");
+        report_error(log_file, "failed to load the model\n");
         return 1;
     }
 
     printf("model loaded: %.2f B params\n\n\n", llama_model_n_params(model) / 1e9);
+
+    // tmpl for chat templating
+    const char *tmpl = llama_model_chat_template(model, nullptr);
+    if (!tmpl)
+    {
+        report_error(log_file, "model metadata does not have the chat template");
+        return 1;
+    }
 
     // vocab handle lives inside the model but is fetched separately (tokenization doesn't need the compute context)
     const llama_vocab *vocab = llama_model_get_vocab(model);
@@ -115,26 +147,56 @@ int main()
     llama_context *ctx = llama_init_from_model(model, cparams);
     if (!ctx)
     {
-        fprintf(stderr, "failed to init the context from the model.\n");
+        report_error(log_file, "failed to init the context from the model.\n");
         return 1;
     }
 
-    const char *prompt = "The capital of India is";
+    // import the system prompt
+    std::ifstream system_prompt_file("prompts/system_prompt.txt");
+    if (!system_prompt_file)
+    {
+        report_error(log_file, "failed to open system prompt file.\n");
+        return 1;
+    }
+
+    std::stringstream rbuf;
+    rbuf << system_prompt_file.rdbuf(); // rdbuf() = the stream's internal buffer; << reads it all in one shot
+    std::string system_prompt = rbuf.str();
+
+    system_prompt_file.close();
+
+    std::string user_prompt;
+    std::cout << "How can I help you today?" << std::endl;
+    std::getline(std::cin, user_prompt);
+
+    llama_chat_message chat[2] = {
+        {"system", system_prompt.c_str()},
+        {"user", user_prompt.c_str()}};
+
+    int32_t buf_capacity = 2 * (system_prompt.size() + user_prompt.size());
+    char *buf = new char[buf_capacity];
+    int buf_len = llama_chat_apply_template(tmpl, chat, 2, true, buf, buf_capacity);
+    while (buf_len > buf_capacity)
+    {
+        buf_capacity = 2 * buf_len;
+        delete[] buf;
+        buf = new char[buf_capacity];
+        buf_len = llama_chat_apply_template(tmpl, chat, 2, true, buf, buf_capacity);
+    }
+
+    for (int i = 0; i < buf_len; i++)
+    {
+        std::cout << buf[i];
+    }
+
     // caller-owns-the-buffer idiom: we allocate tokens[] and pass its capacity (64);
     // llama_tokenize writes into it and returns the count used (negative = buffer too small)
     llama_token tokens[n_ctx];
-    int n = llama_tokenize(vocab, prompt, strlen(prompt), tokens, n_ctx, true, false);
+    int n = llama_tokenize(vocab, buf, buf_len, tokens, n_ctx, true, true);
     if (n < 0)
     {
-        fprintf(stderr, "token buffer too small.\n");
+        report_error(log_file, "token buffer too small.\n");
         return 1;
-    }
-
-    std::cout << "Token Count: " << n << std::endl
-              << "Tokens: ";
-    for (int i = 0; i < n; i++)
-    {
-        std::cout << tokens[i] << " ";
     }
 
     // batch = per-step scratch describing which tokens go in, at which positions, for which sequence;
@@ -149,7 +211,7 @@ int main()
         // return value is just success/failure (0/nonzero) - NOT a token, decode doesn't pick anything
         if (llama_decode(ctx, batch) != 0)
         {
-            fprintf(stderr, "decode failed.\n\n");
+            report_error(log_file, "decode failed.\n\n");
             return 1;
         }
 
@@ -158,7 +220,7 @@ int main()
         float *logits = llama_get_logits_ith(ctx, -1);
         if (!logits)
         {
-            fprintf(stderr, "failed to get the logits.\n\n");
+            report_error(log_file, "failed to get the logits.\n\n");
             return 1;
         }
 
@@ -176,15 +238,15 @@ int main()
         int next_token = pick_logit_topk(logits, n_vocab);
         if (next_token == -1)
         {
-            fprintf(stderr, "failed to get the next token.\n\n");
+            report_error(log_file, "failed to get the next token.\n\n");
             return 1;
         }
 
         // detokenize the logit
-        char buf[128];
-        int len = llama_token_to_piece(vocab, next_token, buf, sizeof(buf), 0, false);
-        printf("\nnext token: '%.*s'  (id=%d, logit=%.2f)\n", len, buf, next_token, logits[next_token]);
-        res.append(buf);
+        char token_buf[128];
+        int len = llama_token_to_piece(vocab, next_token, token_buf, sizeof(token_buf), 0, false);
+        // printf("\nnext token: '%.*s'  (id=%d, logit=%.2f)\n", len, token_buf, next_token, logits[next_token]);
+        res.append(token_buf, len);
 
         // break after model stops
         if (llama_vocab_is_eog(vocab, next_token))
@@ -196,12 +258,13 @@ int main()
         batch = llama_batch_get_one(&tokens[it], 1);
     }
 
-    std::cout << "\nFinal Response:\n\n"
+    std::cout << "\nFinal Response:\n"
               << res << std::endl;
 
     // free the memory - garbage collection
     llama_free(ctx);
     llama_model_free(model);
+    fclose(log_file);
 
     return 0;
 }
