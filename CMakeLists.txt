@@ -7,6 +7,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(llama REQUIRED)
 
-add_executable(hello src/main.cpp)
+add_executable(hello
+    src/main.cpp
+    src/sampling.cpp
+    src/logging.cpp
+)
 
 target_link_libraries(hello PRIVATE llama)
