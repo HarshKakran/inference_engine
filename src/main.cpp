@@ -2,8 +2,87 @@
 #include <cstring>
 #include <cstdio>
 #include <iostream>
+#include <queue>
+#include <vector>
+#include <random>
+#include <string>
 
 int n_ctx = 512;
+float T = 1;
+int K = 5;
+
+float draw()
+{
+    std::random_device rd;                                  // one-time seed source (queries OS entropy)
+    std::mt19937 rng(rd());                                 // the actual PRNG engine (Mersenne Twister), seeded once
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f); // shapes engine output into [0,1)
+
+    return dist(rng);
+}
+
+int pick_logit_topk(float *logits, int n_vocab)
+{
+    auto cmp = [](const std::pair<int, float> &a, const std::pair<int, float> &b)
+    {
+        if (a.second == b.second)
+        {
+            return a.first > b.first;
+        }
+        return a.second < b.second;
+    };
+
+    std::vector<std::pair<int, float>> candidates;
+    candidates.reserve(n_vocab);
+    for (int i = 0; i < n_vocab; i++)
+    {
+        candidates.push_back({i, logits[i]});
+    }
+
+    std::priority_queue<std::pair<int, float>, std::vector<std::pair<int, float>>, decltype(cmp)> pq(cmp, std::move(candidates));
+    if (pq.empty())
+    {
+        return -1;
+    }
+
+    float max_logit = pq.top().second;
+    float topk_exp_logit_sum = 0;
+
+    // get topk logits with Temperature
+    std::vector<std::pair<int, float>> topk_logits;
+    topk_logits.reserve(K);
+    int k = K;
+    while (k-- && !pq.empty())
+    {
+        std::pair<int, float> top_value = pq.top();
+        float logit_value = (top_value.second - max_logit) / T;
+
+        topk_logits.push_back({top_value.first, logit_value});
+        topk_exp_logit_sum += exp(logit_value);
+
+        pq.pop();
+    }
+
+    // softmax topk logits
+    std::vector<std::pair<int, float>> softmax_topk_logits;
+    softmax_topk_logits.reserve(K);
+    for (int i = 0; i < topk_logits.size(); i++)
+    {
+        float softmax_val = exp(topk_logits[i].second) / topk_exp_logit_sum;
+        softmax_topk_logits.push_back({topk_logits[i].first, softmax_val});
+    }
+
+    // pick one from topK
+    float cumulative = 0;
+    float r = draw();
+    for (int i = 0; i < softmax_topk_logits.size(); i++)
+    {
+        cumulative += softmax_topk_logits[i].second;
+        if (r < cumulative)
+            return softmax_topk_logits[i].first;
+    }
+
+    return softmax_topk_logits.back().first;
+}
 
 int main()
 {
@@ -62,6 +141,8 @@ int main()
     // get_one() is the convenience constructor for "single sequence, these n tokens"
     llama_batch batch = llama_batch_get_one(tokens, n);
 
+    std::string res = "";
+
     for (int it = n; it < n_ctx; it++)
     {
         // the forward pass (prefill: all n tokens in one compute-bound shot); fills the KV cache.
@@ -82,19 +163,28 @@ int main()
         }
 
         // Argmax(greedy pick)
-        int next_token = 0;
-        for (int i = 1; i < n_vocab; i++)
+        // int next_token = 0;
+        // for (int i = 1; i < n_vocab; i++)
+        // {
+        //     if (logits[i] > logits[next_token])
+        //     {
+        //         next_token = i;
+        //     }
+        // }
+
+        // topK
+        int next_token = pick_logit_topk(logits, n_vocab);
+        if (next_token == -1)
         {
-            if (logits[i] > logits[next_token])
-            {
-                next_token = i;
-            }
+            fprintf(stderr, "failed to get the next token.\n\n");
+            return 1;
         }
 
         // detokenize the logit
         char buf[128];
         int len = llama_token_to_piece(vocab, next_token, buf, sizeof(buf), 0, false);
         printf("\nnext token: '%.*s'  (id=%d, logit=%.2f)\n", len, buf, next_token, logits[next_token]);
+        res.append(buf);
 
         // break after model stops
         if (llama_vocab_is_eog(vocab, next_token))
@@ -105,6 +195,9 @@ int main()
         tokens[it] = next_token;
         batch = llama_batch_get_one(&tokens[it], 1);
     }
+
+    std::cout << "\nFinal Response:\n\n"
+              << res << std::endl;
 
     // free the memory - garbage collection
     llama_free(ctx);
